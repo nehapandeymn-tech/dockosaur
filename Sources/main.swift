@@ -165,7 +165,8 @@ final class Art {
     let juiceHeld: [CGImage]                  // turbo: the box the dino sips from (3 slurp frames)
     let skates: [CGImage]                     // turbo: roller skates (2 wheel frames)
     let pebble: Frame                         // red marker stone where a pit will open
-    let sign: Frame                           // "PIT AHEAD", drawn at half-pixel resolution (Part.scale 0.5)
+    let signs: [Frame]                        // "PIT AHEAD", "FIRE PIT AHEAD": half-pixel resolution (Part.scale 0.5)
+    let flames: [Frame]                       // fire pit tongues, 4 flicker frames
     private(set) var glyphs: Glyphs = [:]
     private var holes: [Int: CGImage] = [:]
 
@@ -204,8 +205,8 @@ final class Art {
         let peb = pixelImage([".aaaa.", "abccba", "abbbba", ".aaaa."],
                              ["a": 0x4a1010ff, "b": 0xd8322aff, "c": 0xff9a8aff])
         pebble = Frame(image: peb, mask: maskOf(peb))
-        let s = Art.makeSign("PIT AHEAD", g)
-        sign = Frame(image: s, mask: maskOf(s))
+        signs = ["PIT AHEAD", "FIRE PIT AHEAD"].map { let s = Art.makeSign($0, g); return Frame(image: s, mask: maskOf(s)) }
+        flames = [11, 9, 12, 10].enumerated().map { f, h in let img = Art.flame(f, h); return Frame(image: img, mask: maskOf(img)) }
         glyphs = g
         setCharacter(character)
     }
@@ -217,13 +218,38 @@ final class Art {
     }
 
     /// The hole left when a pit caves in: `w` px wide, as deep as the strip goes under the ground.
-    func hole(_ w: Int) -> CGImage {
-        if let h = holes[w] { return h }
+    func hole(_ w: Int, fire: Bool) -> CGImage {
+        let key = fire ? -w : w
+        if let h = holes[key] { return h }
         let k = String(repeating: "k", count: max(0, w - 4))
-        let img = pixelImage(["dd" + k + "dd", "d" + k + "kkd", "k" + k + "kkk"],
-                             ["d": 0x6b4a2bff, "k": 0x120c08ee])
-        holes[w] = img
+        var rows = ["dd" + k + "dd", "d" + k + "kkd", "k" + k + "kkk"]
+        if fire {   // glowing embers: the top row flickers orange, the bed burns red
+            rows[0] = "dd" + String(k.enumerated().map { i, _ in i % 3 == 0 ? "o" : "r" }) + "dd"
+            rows[1] = "d" + String(repeating: "r", count: w - 2) + "d"
+            rows[2] = String(repeating: "e", count: w)
+        }
+        let img = pixelImage(rows, ["d": 0x6b4a2bff, "k": 0x120c08ee, "o": 0xff9a2aff, "r": 0xd8322aff, "e": 0x6a1208ff])
+        holes[key] = img
         return img
+    }
+
+    /// One flame tongue, 7 px wide: yellow core, orange body, red edge, swaying a little per frame.
+    private static func flame(_ f: Int, _ h: Int) -> CGImage {
+        let w = 7
+        let rows = (0..<12).map { r -> String in
+            let y = 11 - r                                     // height above the ground
+            guard y < h else { return String(repeating: ".", count: w) }
+            let t = Double(y) / Double(h)
+            let half = 3.4 * (1 - pow(t, 1.4)) + 0.4
+            let cx = 3 + sin(Double(f) * .pi / 2 + Double(y) * 0.55) * t * 1.3
+            return String((0..<w).map { x -> Character in
+                let d = abs(Double(x) - cx) / half
+                if d > 1 { return "." }
+                if d < 0.4 && t < 0.55 { return "y" }
+                return d < 0.75 && t < 0.85 ? "o" : "r"
+            })
+        }
+        return pixelImage(rows, ["y": 0xffe066ff, "o": 0xff8a1aff, "r": 0xd8322aff])
     }
 
     static let juicePalette: [Character: UInt32] = [
@@ -280,20 +306,20 @@ final class Art {
 // MARK: - Game model
 
 enum Phase { case idle, running, dead }
-enum Sfx { case jump, point, hit, fruit, power, smash, crumble }
+enum Sfx { case jump, point, hit, fruit, power, smash, crumble, fire }
 
 /// Strawberry = big (smashes everything), juice box = turbo (skates and dodges by itself, sipping).
 enum Power { case none, big, turbo }
 enum Fruit { static let cherry = 0, juice = 1, strawberry = 2, orange = 3 }   // indexes into Art.fruits
 
 enum Kind {
-    case spikes(Int), box(Int), saw, bird(Int, high: Bool), fruit(Int), pit(Int), sign
+    case spikes(Int), box(Int), saw, bird(Int, high: Bool), fruit(Int), pit(Int, fire: Bool), sign(fire: Bool)
 }
 
 struct Thing {
     var kind: Kind
     var x: Double          // left edge of the visible body
-    var y: Double = 0      // body bottom (fruit only)
+    var y: Double = 0      // body bottom (fruit); pits: the moment they opened (in `t` time)
     var t: Double = 0
     var gone = false
     var opened = false     // pits only: the ground has caved in
@@ -304,12 +330,14 @@ struct Thing {
         case .saw: return 38
         case .bird: return 27
         case .fruit: return 14
-        case .pit(let w): return Double(w)
-        case .sign: return 35
+        case .pit(let w, _): return Double(w)
+        case .sign(let fire): return fire ? 51 : 35
         }
     }
     var isFruit: Bool { if case .fruit = kind { return true }; return false }
     var isPit: Bool { if case .pit = kind { return true }; return false }
+    var isBox: Bool { if case .box = kind { return true }; return false }
+    var isFirePit: Bool { if case .pit(_, true) = kind { return true }; return false }
     /// Hurts on contact. Pits hurt by falling in instead; signs are scenery.
     var isSolid: Bool { switch kind { case .fruit, .pit, .sign: return false; default: return true } }
     var isHighBird: Bool { if case .bird(_, let high) = kind { return high }; return false }
@@ -339,6 +367,7 @@ final class Game {
     var clock = 0.0, runPhase = 0.0, deadAt = -100.0, bufferedJump = -100.0, flashAt = -100.0
     var playTime = 0.0     // only ticks while running, so power-ups don't run out during a pause
     var power = Power.none, powerStart = 0.0, powerEnd = 0.0, graceEnd = -100.0
+    var flipStart = -1.0, flipDur = 0.5   // somersault over a crate (drawing only; the hitbox doesn't spin)
     private(set) var turboBumps = 0  // hits the turbo autopilot failed to dodge (absorbed): self-test metric
     var scroll = 0.0
     var rng: RNG
@@ -356,6 +385,13 @@ final class Game {
     }
 
     var runSpeed: Double { power == .turbo ? min(K.maxSpeed * 1.6, speed * K.turboMul) : speed }
+    /// Forward somersault angle in radians, 0 when not flipping.
+    var flipAngle: Double {
+        guard flipStart >= 0, !onGround else { return 0 }
+        let k = (playTime - flipStart) / flipDur
+        guard k < 1 else { return 0 }
+        return 2 * .pi * (k < 0.5 ? 2 * k * k : 1 - pow(-2 * k + 2, 2) / 2)   // ease in-out
+    }
     var invincible: Bool { power == .turbo || playTime < graceEnd }
     var powerLeft: Double { power == .none ? 0 : max(0, powerEnd - playTime) }
     /// Grows over a quarter second when the strawberry kicks in and shrinks back as it wears off.
@@ -394,13 +430,20 @@ final class Game {
         speed = K.startSpeed; score = 0; runPhase = 0; playTime = 0
         power = .none; graceEnd = -100
         gapLeft = max(120, worldW * 0.55)
-        dinoY = 0; vy = 0; onGround = true; falling = false
+        dinoY = 0; vy = 0; onGround = true; falling = false; flipStart = -1
         aiRun = autopilot
     }
 
     private func jump() {
         vy = power == .big ? K.jumpV * 0.75 : K.jumpV   // a giant only hops, so its head stays on screen
         onGround = false
+        // Jumping a crate (and only a crate) earns a 360: spin if one lies within this jump's reach.
+        let air = 2 * vy / K.gravity, reach = K.dinoX + 19 + runSpeed * air * 0.75
+        if power == .none, things.contains(where: { $0.isBox && !$0.gone && $0.x + $0.width > K.dinoX + 4 && $0.x < reach }) {
+            flipStart = playTime; flipDur = air * 0.85
+        } else {
+            flipStart = -1
+        }
         sound(.jump)
     }
 
@@ -469,6 +512,7 @@ final class Game {
     }
 
     private func landed() {
+        flipStart = -1
         fx.append(Effect(look: .dust, x: K.dinoX - 2, y: -4, life: 0.3))
         fx.append(Effect(look: .dust, x: K.dinoX + 8 * dinoScale, y: -4, life: 0.25))
         if clock - bufferedJump < 0.15 {
@@ -481,7 +525,7 @@ final class Game {
     private func spawn() {
         var options: [(Kind, Double)] = [(.spikes(1), 3), (.spikes(2), 2)]
         if score >= 100 { options.append((.box(rng.int(2)), 2)) }
-        if score >= 150 { options.append((.pit(0), 1.2)) }
+        if score >= 150 { options.append((.pit(0, fire: score >= 300 && rng.unit() < 0.4), 1.2)) }
         if score >= 200 { options.append((.saw, 1.5)) }
         if score >= 250 { options.append((.spikes(3), 1.3)) }
         if score >= 350 {
@@ -493,11 +537,13 @@ final class Game {
         for (k, w) in options { if r < w { kind = k; break }; r -= w }
 
         let v = runSpeed
-        if case .pit = kind {
+        if case .pit(_, let fire) = kind {
             // Warning sign first, then the red pebble that marks where the ground will give way.
-            let w = 32 + rng.int(9), lead = max(110, v * 0.9)
-            things.append(Thing(kind: .sign, x: worldW + 4))
-            things.append(Thing(kind: .pit(w), x: worldW + 4 + lead))
+            // About 3/4 of a full jump wide at the normal (non-turbo) speed: a tap-hop won't clear it.
+            let jump = speed * 2 * K.jumpV / K.gravity
+            let w = Int(jump * rng.range(0.7, 0.78)), lead = max(130, v * 0.9)
+            things.append(Thing(kind: .sign(fire: fire), x: worldW + 4))
+            things.append(Thing(kind: .pit(w, fire: fire), x: worldW + 4 + lead))
             gapLeft = lead + Double(w) + v * rng.range(0.75, 1.3) + 26
             return
         }
@@ -550,10 +596,17 @@ final class Game {
             let f = art.fruits[k][Int(t.t * 20) % 17]
             let f0 = art.fruits[k][0].mask
             return [Part(frame: f, x: t.x - Double(f0.padLeft), y: t.y - Double(f0.padBottom))]
-        case .pit:
-            return t.opened ? [] : [Part(frame: art.pebble, x: t.x, y: 0)]
-        case .sign:
-            return [Part(frame: art.sign, x: t.x, y: 0, scale: 0.5)]
+        case .pit(let w, let fire):
+            if !t.opened { return [Part(frame: art.pebble, x: t.x, y: 0)] }
+            guard fire else { return [] }
+            // Flames shoot up out of the hole, kept a few px in from both edges.
+            let rise = min(1, (t.t - t.y) / 0.25), sink = -12 * (1 - rise)
+            let n = max(1, (w - 16 - 7) / 6 + 1)
+            return (0..<n).map { i in
+                Part(frame: art.flames[(Int(t.t * 12) + i * 3) % 4], x: t.x + 8 + Double(i * 6), y: sink)
+            }
+        case .sign(let fire):
+            return [Part(frame: art.signs[fire ? 1 : 0], x: t.x, y: 0, scale: 0.5)]
         }
     }
 
@@ -580,11 +633,12 @@ final class Game {
         let front = K.dinoX + 4 + 15 * dinoScale
         for i in things.indices where things[i].isPit && !things[i].opened && things[i].x <= front + runSpeed * K.pitOpenLead {
             things[i].opened = true
+            things[i].y = things[i].t
             let x = things[i].x, w = things[i].width
             fx.append(Effect(look: .poof, x: x + w / 2 - 16, y: -16, life: 0.33))
             fx.append(Effect(look: .dust, x: x - 4, y: -4, life: 0.3))
             fx.append(Effect(look: .dust, x: x + w - 10, y: -4, life: 0.3))
-            sound(.crumble)
+            sound(things[i].isFirePit ? .fire : .crumble)
         }
     }
 
@@ -597,13 +651,13 @@ final class Game {
         if power == .big { smash(); return }
         let i = dinoFrame
         let dx = Int(K.dinoX.rounded()), dy = Int((dinoY - 3).rounded())
-        for n in things.indices where !things[n].gone && (things[n].isFruit || things[n].isSolid) {
+        for n in things.indices where !things[n].gone && (things[n].isFruit || things[n].isSolid || things[n].isFirePit) {
             let fruit = things[n].isFruit
             let me = fruit ? art.dino[i].mask : art.dinoHit[i]
             for p in parts(things[n]) where overlaps(me, dx, dy, p.frame.mask, Int(p.x.rounded()), Int(p.y.rounded())) {
                 if fruit { collect(n); break }
                 if invincible {
-                    if power == .turbo { turboBumps += 1; smashThing(n) }
+                    if power == .turbo { turboBumps += 1; if !things[n].isPit { smashThing(n) } }
                     break
                 }
                 die(); return
@@ -664,7 +718,7 @@ final class Game {
     }
 
     private func die() {
-        phase = .dead; deadAt = clock; holding = false; aiHolding = false
+        phase = .dead; deadAt = clock; holding = false; aiHolding = false; flipStart = -1
         power = .none
         sound(.hit)
         if !aiRun && Int(score) > best { best = Int(score); onBest(best) }
@@ -823,7 +877,7 @@ final class Scene {
         n = 0
         for p in pits {
             let l = pooled(&holePool, n, in: groundBox)
-            place(l, art.hole(Int(p.width)), p.x, -K.below)
+            place(l, art.hole(Int(p.width), fire: p.isFirePit), p.x, -K.below)
             l.opacity = fade(l.frame.midX)
             n += 1
         }
@@ -856,7 +910,9 @@ final class Scene {
         let skating = g.power == .turbo && g.phase == .running
         let frame = g.dinoFrame
         let bodyY = g.dinoY - 3 * s + (skating ? K.skateLift : 0)
+        dinoL.setAffineTransform(.identity)
         place(dinoL, art.dino[frame].image, K.dinoX, bodyY, scale: s)
+        if g.flipAngle != 0 { dinoL.setAffineTransform(CGAffineTransform(rotationAngle: -CGFloat(g.flipAngle))) }   // clockwise = forward
         skateL.isHidden = !skating; juiceL.isHidden = !skating
         if skating {
             place(skateL, art.skates[Int(g.playTime * 14) % 2], K.dinoX + 5, g.dinoY)
@@ -988,6 +1044,7 @@ final class Sounds {
         players[.power] = make(tone(660, 0.05) + tone(880, 0.05) + tone(1100, 0.05) + tone(1320, 0.05) + tone(1760, 0.12))
         players[.smash] = make(sweep(220, 60, 0.12, noise: 0.6))
         players[.crumble] = make(sweep(150, 45, 0.22, noise: 0.75))
+        players[.fire] = make(sweep(90, 260, 0.3, noise: 0.85))
     }
 
     func play(_ s: Sfx) {
@@ -1463,11 +1520,17 @@ func snapshot(_ args: [String]) {
             for _ in 0..<60 { g.step(1.0 / 120) }
             if args.contains("--clear") { for _ in 0..<45 { g.things = []; g.step(1.0 / 120) } }   // land and cruise
         }
+        if args.contains("--flip") {   // mid-somersault over a crate
+            g.autopilot = false
+            g.things = [Thing(kind: .box(0), x: K.dinoX + 2)]
+            g.dinoY = 26; g.onGround = false; g.vy = 0
+            g.flipStart = g.playTime - 0.18; g.flipDur = 0.5
+        }
         if args.contains("--pit") {    // a staged pit scene: open pit under a jumping dino, sign + pebble ahead
             g.autopilot = false
-            var open = Thing(kind: .pit(36), x: K.dinoX + 2); open.opened = true
+            var open = Thing(kind: .pit(70, fire: args.contains("--fire")), x: K.dinoX - 30); open.opened = true; open.t = 1
             g.things = [open, Thing(kind: .bird(0, high: true), x: 70), Thing(kind: .bird(1, high: false), x: 125),
-                        Thing(kind: .sign, x: g.worldW - 150), Thing(kind: .pit(36), x: g.worldW - 40),
+                        Thing(kind: .sign(fire: args.contains("--fire")), x: g.worldW - 150), Thing(kind: .pit(70, fire: false), x: g.worldW - 40),
                         Thing(kind: .fruit(Fruit.juice), x: g.worldW - 75, y: 14)]
             g.dinoY = 22; g.onGround = false; g.vy = 0
         }
@@ -1515,7 +1578,7 @@ func selftest() -> Int32 {
     check(art.saw.count == 8 && art.birds.allSatisfy { $0.count == 5 && !$0[2].mask.isEmpty }, "saw + bird frames")
     check(art.fruits.allSatisfy { $0.count == 17 }, "fruit frames")
     check(art.juiceHeld.count == 3 && art.skates.count == 2 && !art.fruits[Fruit.juice][0].mask.isEmpty, "juice box + skates")
-    for ch in "HI 0123456789 GAME OVER PAUSED TAP RIGHT OPTION TO PLAY CLICK OR CTRL+OPT+SPACE +50 +10 BIG! TURBO! PIT AHEAD" where ch != " " {
+    for ch in "HI 0123456789 GAME OVER PAUSED TAP RIGHT OPTION TO PLAY CLICK OR CTRL+OPT+SPACE +50 +10 BIG! TURBO! FIRE PIT AHEAD" where ch != " " {
         check(art.glyphs[ch] != nil, "glyph \(ch)")
     }
 
@@ -1561,20 +1624,43 @@ func selftest() -> Int32 {
     a.things = []; a.press()
     check(a.onGround, "presses are ignored during turbo")
 
+    // Somersault: jumping a crate flips the dino, jumping spikes doesn't.
+    let c = Game(art: art, seed: 1)
+    c.press(); c.release(); c.step(1)
+    c.things = [Thing(kind: .box(0), x: K.dinoX + 40)]
+    c.press(); c.step(0.15)
+    check(c.flipAngle > 0, "jumping a crate starts a somersault")
+    let sp = Game(art: art, seed: 1)
+    sp.press(); sp.release(); sp.step(1)
+    sp.things = [Thing(kind: .spikes(2), x: K.dinoX + 40)]
+    sp.press(); sp.step(0.15)
+    check(sp.flipAngle == 0, "no somersault over spikes")
+
     // Pit: closed while far away (only the pebble shows), opens near the dino, and standing over it is fatal.
     let p = Game(art: art, seed: 1)
     p.press(); p.release(); p.step(1)
-    p.things = [Thing(kind: .pit(36), x: 160)]
+    p.things = [Thing(kind: .pit(70, fire: false), x: 160)]
     p.step(1.0 / 120)
     check(!p.things[0].opened && p.parts(p.things[0]).count == 1, "pit hidden behind its pebble at a distance")
     for _ in 0..<120 { p.step(1.0 / 120) }
     check(p.things.first?.opened == true && p.phase == .dead && p.falling, "running onto a pit drops the dino")
-    let q = Game(art: art, seed: 1)
-    q.press(); q.release(); q.step(1)
-    q.things = [Thing(kind: .pit(40), x: 160)]
-    q.autopilot = true
-    for _ in 0..<240 { q.step(1.0 / 120) }
-    check(q.phase == .running, "a timed jump clears a pit")
+    let jumpLen = K.startSpeed * 2 * K.jumpV / K.gravity
+    for fire in [false, true] {
+        let q = Game(art: art, seed: 1)
+        q.press(); q.release(); q.step(1)
+        q.things = [Thing(kind: .pit(Int(jumpLen * 0.78), fire: fire), x: 160)]
+        q.autopilot = true
+        for _ in 0..<240 { q.step(1.0 / 120) }
+        check(q.phase == .running, "a full jump clears a \(fire ? "fire " : "")pit \(Int(jumpLen * 0.78)) px wide")
+    }
+    // A short hop into a fire pit gets burned.
+    let f = Game(art: art, seed: 1)
+    f.press(); f.release(); f.step(1)
+    var fp = Thing(kind: .pit(70, fire: true), x: K.dinoX - 20); fp.opened = true; fp.t = 1
+    f.things = [fp]
+    f.dinoY = 4; f.vy = 0; f.onGround = false
+    for _ in 0..<6 { f.step(1.0 / 120) }
+    check(f.phase == .dead && !f.falling, "flames burn a low jumper")
 
     // Fairness: the autopilot should survive long stretches at every speed.
     var deaths = 0, bestScore = 0, bumps = 0

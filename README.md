@@ -9,7 +9,9 @@ A tiny pixel dino that runs on top of your macOS Dock. Play it while you work: j
 - **Jump:** tap **Right ⌥**, press **⌃⌥Space**, or click the strip. Hold to jump higher.
 - **Jump** spikes, crates, saws and low-gliding pterodactyls. **Stay down** under high-flying pterodactyls.
 - **Pits:** a PIT AHEAD sign warns you, then a red pebble marks the edge. The ground only caves in
-  when you're right on top of it, so jump at the pebble.
+  when you're right on top of it, so jump at the pebble. Pits are about 3/4 of a full jump wide: hold the jump.
+- **Fire pits** (from 300): FIRE PIT AHEAD. Flames shoot up when the ground opens, so jump high and on time.
+- Jump a crate and the dino does a 360 somersault.
 - **Fruit** (+50 each):
   - Cherry and orange: just points.
   - Strawberry: the dino grows huge for 6 s and smashes everything it touches (+10 per smash).
