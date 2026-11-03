@@ -419,7 +419,8 @@ final class Game {
 
     func release() {
         holding = false
-        if phase == .running && !onGround && vy > K.releaseV { vy = K.releaseV }
+        // During turbo the autopilot owns the jump: a stray tap must not cut it short.
+        if phase == .running && !onGround && power != .turbo && vy > K.releaseV { vy = K.releaseV }
     }
 
     func pause() { if phase == .running { paused = true; holding = false } }
@@ -725,7 +726,7 @@ final class Game {
         onDeath()
     }
 
-    /// Autopilot: plays the game itself (demo mode, the apple power, and the self-test's fairness check).
+    /// Autopilot: plays the game itself (demo mode, the juice-box turbo, and the self-test's fairness check).
     private func think() {
         switch phase {
         case .idle: if autopilot { press(); release() }; return
@@ -1623,6 +1624,9 @@ func selftest() -> Int32 {
     check(a.power == .turbo && a.runSpeed > a.speed * 1.5, "juice box gives turbo")
     a.things = []; a.press()
     check(a.onGround, "presses are ignored during turbo")
+    a.things = [Thing(kind: .spikes(2), x: K.dinoX + 60)]
+    for i in 0..<120 { if i % 6 == 0 { a.press() }; if i % 6 == 2 { a.release() }; a.step(1.0 / 120) }
+    check(a.turboBumps == 0, "tapping during turbo doesn't cut the autopilot's jump (\(a.turboBumps) bumps)")
 
     // Somersault: jumping a crate flips the dino, jumping spikes doesn't.
     let c = Game(art: art, seed: 1)
