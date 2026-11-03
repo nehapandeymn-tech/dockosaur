@@ -38,6 +38,7 @@ Needs macOS 14+.
 
 ## Credits
 
-- Dinos: [Arks](https://arks.itch.io/dino-characters) ([@ArksDigital](https://twitter.com/ArksDigital)), CC BY 4.0
-- Spikes, crates, saw, fruit and font: [Pixel Frog](https://pixelfrog-assets.itch.io/pixel-adventure-1), CC0
-- Hawks: [MoikMellah](https://opengameart.org/content/animated-birds-32x32), CC0
+- Dinos: [Dino Characters](https://arks.itch.io/dino-characters) by Arks ([@ArksDigital](https://twitter.com/ArksDigital)),
+  licensed [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/). Used unmodified.
+- Hawks: [Animated Birds](https://opengameart.org/content/animated-birds-32x32) by MoikMellah, CC0 (magenta background made transparent).
+- Spikes, crates, saw, fruit and font: [Pixel Adventure](https://pixelfrog-assets.itch.io/pixel-adventure-1) by Pixel Frog, CC0
