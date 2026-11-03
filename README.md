@@ -7,8 +7,18 @@ A tiny pixel dino that runs on top of your macOS Dock. Play it while you work: j
 ## Play
 
 - **Jump:** tap **Right ⌥**, press **⌃⌥Space**, or click the strip. Hold to jump higher.
-- **Jump** spikes, crates, saws and low-gliding hawks. **Stay down** under high-flying hawks.
-- Grab fruit for +50. It speeds up as you go, and your best score is saved.
+- **Jump** spikes, crates, saws and low-gliding pterodactyls. **Stay down** under high-flying pterodactyls.
+- **Pits:** a PIT AHEAD sign warns you, then a red pebble marks the edge. The ground only caves in
+  when you're right on top of it, so jump at the pebble. Pits are about 3/4 of a full jump wide: hold the jump.
+- **Fire pits** (from 300): FIRE PIT AHEAD. Flames shoot up when the ground opens, so jump high and on time.
+- Jump a crate and the dino does a 360 somersault.
+- **Fruit** (+50 each):
+  - Cherry and orange: just points.
+  - Strawberry: the dino grows huge for 6 s and smashes everything it touches (+10 per smash).
+  - Juice box: turbo for 5 s. The dino straps on roller skates and sips the juice while it zooms along
+    at super speed, dodging everything by itself. No input needed.
+  - The dino blinks as a power wears off, and stays safe for a moment after.
+- It speeds up as you go, and your best score is saved.
 
 Clicks pass through to your windows unless the pointer is over the strip, and clicking it never takes focus from the app you're typing in. Right-click the strip for settings: dino colour, size, width, sound, autopilot, launch at login.
 
@@ -40,5 +50,5 @@ Needs macOS 14+.
 
 - Dinos: [Dino Characters](https://arks.itch.io/dino-characters) by Arks ([@ArksDigital](https://twitter.com/ArksDigital)),
   licensed [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/). Used unmodified.
-- Hawks: [Animated Birds](https://opengameart.org/content/animated-birds-32x32) by MoikMellah, CC0 (magenta background made transparent).
 - Spikes, crates, saw, fruit and font: [Pixel Adventure](https://pixelfrog-assets.itch.io/pixel-adventure-1) by Pixel Frog, CC0
+- Pterodactyls, pit sign, pebble, juice box and roller skates: drawn for Dockosaur (`Tools/ptero.swift` regenerates `Resources/Art/ptero.png`)
