@@ -3,7 +3,7 @@
 // Art (see README for links and licences):
 //   dinos            Arks (@ArksDigital), CC BY 4.0
 //   spikes/crates/saw/fruit/dust/font  Pixel Frog, CC0
-//   hawks            MoikMellah, CC0
+//   pterodactyls     drawn for Dockosaur by Tools/ptero.swift
 //
 // Units: game distances are art pixels ("px"), times are seconds. One px is drawn as
 // `scale` points (2 by default), so the art stays crisp on Retina screens.
@@ -29,6 +29,14 @@ enum K {
     static let fruitBonus = 50.0
     static let highBirdBottom = 21.0 // dino head is ~17 px tall: stay on the ground to pass under
     static let lowBirdBottom = 3.0   // gliders skim the ground: jump them
+    static let smashBonus = 10.0
+    static let bigScale = 1.75       // strawberry: the dino grows this much and smashes what it touches
+    static let bigTime = 6.0
+    static let turboTime = 5.0       // juice box: the dino skates itself at turbo speed
+    static let skateLift = 3.0       // the wheels raise the dino this much (drawing only)
+    static let turboMul = 1.8
+    static let grace = 0.9           // invincible this long after a power wears off
+    static let pitOpenLead = 0.15    // a pit caves in this many seconds before the dino reaches it
 }
 
 // MARK: - Small helpers
@@ -51,6 +59,13 @@ struct RNG {   // SplitMix64: deterministic for snapshots and the self-test
 struct Mask {
     let w: Int, h: Int
     let bits: [Bool]
+    let box: CGRect                  // opaque bounds, row 0 at the bottom
+    init(w: Int, h: Int, bits: [Bool]) {
+        self.w = w; self.h = h; self.bits = bits
+        var x0 = w, y0 = h, x1 = 0, y1 = 0
+        for y in 0..<h { for x in 0..<w where bits[y * w + x] { x0 = min(x0, x); y0 = min(y0, y); x1 = max(x1, x + 1); y1 = max(y1, y + 1) } }
+        box = x1 > x0 ? CGRect(x: x0, y: y0, width: x1 - x0, height: y1 - y0) : .zero
+    }
     func solid(_ x: Int, _ y: Int) -> Bool { x >= 0 && y >= 0 && x < w && y < h && bits[y * w + x] }
     var padBottom: Int { for y in 0..<h { for x in 0..<w where bits[y * w + x] { return y } }; return h }
     var padLeft: Int { for x in 0..<w { for y in 0..<h where bits[y * w + x] { return x } }; return w }
@@ -115,6 +130,26 @@ let characters: [(id: String, name: String)] = [
     ("vita", "Vita (green)"), ("doux", "Doux (blue)"), ("mort", "Mort (red)"), ("tard", "Tard (yellow)"),
 ]
 
+/// Tiny hand-drawn sprites: one character per pixel, row 0 at the top. Colours are 0xRRGGBBAA.
+func pixelImage(_ rows: [String], _ pal: [Character: UInt32]) -> CGImage {
+    let h = rows.count, w = rows.map(\.count).max() ?? 1
+    var buf = [UInt8](repeating: 0, count: w * h * 4)
+    for (y, row) in rows.enumerated() {
+        for (x, ch) in row.enumerated() {
+            guard let c = pal[ch] else { continue }
+            let a = UInt32(c & 0xff), i = (y * w + x) * 4
+            buf[i] = UInt8((c >> 24) * a / 255); buf[i + 1] = UInt8((c >> 16 & 0xff) * a / 255)
+            buf[i + 2] = UInt8((c >> 8 & 0xff) * a / 255); buf[i + 3] = UInt8(a)
+        }
+    }
+    return buf.withUnsafeMutableBytes { p in
+        CGContext(data: p.baseAddress, width: w, height: h, bitsPerComponent: 8, bytesPerRow: w * 4,
+                  space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!.makeImage()!
+    }
+}
+
+typealias Glyphs = [Character: (white: CGImage, black: CGImage)]
+
 final class Art {
     private(set) var dino: [Frame] = []       // 0-3 idle, 4-9 run, 10-12 kick, 13-16 hurt, 17-23 crouch
     private(set) var dinoHit: [Mask] = []
@@ -122,31 +157,56 @@ final class Art {
     let spike: Frame
     let boxes: [Frame]
     let saw: [Frame]
-    let birds: [[Frame]]                      // [grey, brown] x 5 wing frames, facing left
+    let birds: [[Frame]]                      // pterodactyls: [purple, rust] x 5 wing frames, facing left
     let birdPadLeft: [Int], birdPadBottom: [Int]
-    let fruits: [[Frame]]
+    let fruits: [[Frame]]                     // see `Fruit` for the order
     let poof: [CGImage]
     let dust = loadPNG("dust")
-    private(set) var glyphs: [Character: (white: CGImage, black: CGImage)] = [:]
+    let juiceHeld: [CGImage]                  // turbo: the box the dino sips from (3 slurp frames)
+    let skates: [CGImage]                     // turbo: roller skates (2 wheel frames)
+    let pebble: Frame                         // red marker stone where a pit will open
+    let sign: Frame                           // "PIT AHEAD", drawn at half-pixel resolution (Part.scale 0.5)
+    private(set) var glyphs: Glyphs = [:]
+    private var holes: [Int: CGImage] = [:]
 
     init(character: String) {
         spike = slice(loadPNG("spikes"), fw: 16, fh: 16, count: 1)[0]
         boxes = [slice(loadPNG("box1"), fw: 28, fh: 24, count: 1)[0], slice(loadPNG("box2"), fw: 28, fh: 24, count: 1)[0]]
         saw = slice(loadPNG("saw"), fw: 38, fh: 38, count: 8)
-        let b = loadPNG("birds")
+        let b = loadPNG("ptero")
         birds = [slice(b, fw: 32, fh: 32, row: 0, count: 5), slice(b, fw: 32, fh: 32, row: 1, count: 5)]
         birdPadLeft = birds.map { $0.map(\.mask.padLeft).min()! }
         birdPadBottom = birds.map { $0.map(\.mask.padBottom).min()! }
-        fruits = ["cherries", "apple", "strawberry", "orange"].map { slice(loadPNG("fruit_" + $0), fw: 32, fh: 32, count: 17) }
+        let cherries = slice(loadPNG("fruit_cherries"), fw: 32, fh: 32, count: 17)
+        fruits = [cherries, Art.juiceBox(), slice(loadPNG("fruit_strawberry"), fw: 32, fh: 32, count: 17),
+                  slice(loadPNG("fruit_orange"), fw: 32, fh: 32, count: 17)]
+        let held = [".......", "sssss..", "....s..", "..aaaaaa", "..aLLLda", "..aOROea", "..aOOOea", "..aLLLda", "..aaaaaa"]
+        juiceHeld = (0..<3).map { f in
+            var rows = held
+            rows[1] = Array(rows[1]).enumerated().map { i, c in i == [3, 2, 0][f] ? "j" : String(c) }.joined()   // a sip travels up the straw
+            if f == 2 { rows[4] = "...aLLda"; rows[7] = "...aLLda" }                                             // squeezed carton
+            return pixelImage(rows, Art.juicePalette)
+        }
+        skates = [".awa....awa.", ".aWa....aWa."].map {
+            pixelImage([".aaaaaaaaaa.", "abbbbbwbbbba", "aaaaaaaaaaaa", $0, "..a......a.."],
+                       ["a": 0x2a1d0eff, "b": 0xd8322aff, "w": 0xffffffff, "W": 0x8a8a8aff])
+        }
         poof = slice(loadPNG("poof"), fw: 32, fh: 32, count: 6).map(\.image)
         let white = loadPNG("font_white"), black = loadPNG("font_black")
         let rows = ["ABCDEFGHIJ", "KLMNOPQRST", "UVWXYZ", "0123456789", ".,:?!()+-"]
+        var g: Glyphs = [:]
         for (r, chars) in rows.enumerated() {
             for (i, c) in chars.enumerated() {
                 let rect = CGRect(x: i * 8, y: r * 10, width: 8, height: 10)
-                glyphs[c] = (white.cropping(to: rect)!, black.cropping(to: rect)!)
+                g[c] = (white.cropping(to: rect)!, black.cropping(to: rect)!)
             }
         }
+        let peb = pixelImage([".aaaa.", "abccba", "abbbba", ".aaaa."],
+                             ["a": 0x4a1010ff, "b": 0xd8322aff, "c": 0xff9a8aff])
+        pebble = Frame(image: peb, mask: maskOf(peb))
+        let s = Art.makeSign("PIT AHEAD", g)
+        sign = Frame(image: s, mask: maskOf(s))
+        glyphs = g
         setCharacter(character)
     }
 
@@ -155,15 +215,79 @@ final class Art {
         dino = slice(loadPNG("dino_" + valid), fw: 24, fh: 24, count: 24)
         dinoHit = dino.map { $0.mask.eroded() }
     }
+
+    /// The hole left when a pit caves in: `w` px wide, as deep as the strip goes under the ground.
+    func hole(_ w: Int) -> CGImage {
+        if let h = holes[w] { return h }
+        let k = String(repeating: "k", count: max(0, w - 4))
+        let img = pixelImage(["dd" + k + "dd", "d" + k + "kkd", "k" + k + "kkk"],
+                             ["d": 0x6b4a2bff, "k": 0x120c08ee])
+        holes[w] = img
+        return img
+    }
+
+    static let juicePalette: [Character: UInt32] = [
+        "a": 0x2a1d0eff, "L": 0xeef6ffff, "d": 0xc4d2e2ff, "O": 0xff9a2aff, "e": 0xd8781aff,
+        "R": 0xd8322aff, "g": 0x3c8a2aff, "s": 0xff6a9aff, "j": 0xffb02aff,
+    ]
+
+    /// The pickup that replaces the apple: a juice carton with a bent straw, bobbing like the fruit do.
+    private static func juiceBox() -> [Frame] {
+        let box = ["........ss", ".......s..", ".......s..", ".aaaaaaaa.", "aLLLLLLLda", "aLLLLLLLda", "aOOOgOOOea",
+                   "aOORROOOea", "aORRRROOea", "aOORROOOea", "aOOOOOOOea", "aLLLLLLLda", "aaaaaaaaaa"]
+        return (0..<17).map { f in
+            let dy = Int((sin(Double(f) / 17 * 2 * .pi) * 1.5).rounded())
+            let top = 10 + dy
+            let rows = (0..<32).map { y -> String in
+                let r = y - top
+                guard r >= 0 && r < box.count else { return String(repeating: ".", count: 32) }
+                return String(repeating: ".", count: 11) + box[r] + String(repeating: ".", count: 11)
+            }
+            let img = pixelImage(rows, juicePalette)
+            return Frame(image: img, mask: maskOf(img))
+        }
+    }
+
+    /// A yellow warning board on a post, in half-px units so the pixel font fits.
+    private static func makeSign(_ text: String, _ glyphs: Glyphs) -> CGImage {
+        let tw = text.reduce(0) { $0 + ($1 == " " ? 4 : 7) } - 1
+        let W = (tw + 11) / 2 * 2, postH = 20, H = postH + 16
+        let ctx = CGContext(data: nil, width: W, height: H, bitsPerComponent: 8, bytesPerRow: 0,
+                            space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!
+        ctx.interpolationQuality = .none
+        func fill(_ x: Int, _ y: Int, _ w: Int, _ h: Int, _ rgb: UInt32) {
+            ctx.setFillColor(CGColor(srgbRed: CGFloat(rgb >> 16) / 255, green: CGFloat(rgb >> 8 & 0xff) / 255,
+                                     blue: CGFloat(rgb & 0xff) / 255, alpha: 1))
+            ctx.fill(CGRect(x: x, y: y, width: w, height: h))
+        }
+        let ink = 0x2a1d0e as UInt32
+        fill(W / 2 - 4, 0, 8, postH + 2, ink)               // post
+        fill(W / 2 - 2, 0, 4, postH, 0x8a5a2b)
+        fill(0, postH, W, 16, ink)                          // board
+        fill(2, postH + 2, W - 4, 12, 0xffcc33)
+        fill(2, postH + 2, W - 4, 2, 0xd89a1c)
+        fill(2, postH + 12, W - 4, 2, 0xffe680)
+        var cx = (W - tw) / 2 - 1                           // glyph ink starts 1 px into its cell
+        for ch in text {
+            if ch == " " { cx += 4; continue }
+            if let g = glyphs[ch] { ctx.draw(g.black, in: CGRect(x: cx, y: postH + 3, width: 8, height: 10)) }
+            cx += 7
+        }
+        return ctx.makeImage()!
+    }
 }
 
 // MARK: - Game model
 
 enum Phase { case idle, running, dead }
-enum Sfx { case jump, point, hit, fruit }
+enum Sfx { case jump, point, hit, fruit, power, smash, crumble }
+
+/// Strawberry = big (smashes everything), juice box = turbo (skates and dodges by itself, sipping).
+enum Power { case none, big, turbo }
+enum Fruit { static let cherry = 0, juice = 1, strawberry = 2, orange = 3 }   // indexes into Art.fruits
 
 enum Kind {
-    case spikes(Int), box(Int), saw, bird(Int, high: Bool), fruit(Int)
+    case spikes(Int), box(Int), saw, bird(Int, high: Bool), fruit(Int), pit(Int), sign
 }
 
 struct Thing {
@@ -172,6 +296,7 @@ struct Thing {
     var y: Double = 0      // body bottom (fruit only)
     var t: Double = 0
     var gone = false
+    var opened = false     // pits only: the ground has caved in
     var width: Double {
         switch kind {
         case .spikes(let n): return Double(n * 15)
@@ -179,14 +304,19 @@ struct Thing {
         case .saw: return 38
         case .bird: return 27
         case .fruit: return 14
+        case .pit(let w): return Double(w)
+        case .sign: return 35
         }
     }
     var isFruit: Bool { if case .fruit = kind { return true }; return false }
+    var isPit: Bool { if case .pit = kind { return true }; return false }
+    /// Hurts on contact. Pits hurt by falling in instead; signs are scenery.
+    var isSolid: Bool { switch kind { case .fruit, .pit, .sign: return false; default: return true } }
     var isHighBird: Bool { if case .bird(_, let high) = kind { return high }; return false }
     var extraSpeed: Double { if case .bird = kind { return 22 }; return 0 }
 }
 
-struct Part { let frame: Frame; let x: Double; let y: Double }   // frame origin in world px
+struct Part { let frame: Frame; let x: Double; let y: Double; var scale = 1.0 }   // frame origin in world px
 
 struct Effect {
     enum Look { case dust, poof, text(String) }
@@ -201,17 +331,21 @@ final class Game {
     var phase = Phase.idle
     var paused = false
     var worldW = 360.0
-    var dinoY = 0.0, vy = 0.0, onGround = true, holding = false
+    var dinoY = 0.0, vy = 0.0, onGround = true, holding = false, falling = false
     var speed = K.startSpeed, score = 0.0, best = 0
     var things: [Thing] = []
     var fx: [Effect] = []
     var gapLeft = 0.0
     var clock = 0.0, runPhase = 0.0, deadAt = -100.0, bufferedJump = -100.0, flashAt = -100.0
+    var playTime = 0.0     // only ticks while running, so power-ups don't run out during a pause
+    var power = Power.none, powerStart = 0.0, powerEnd = 0.0, graceEnd = -100.0
+    private(set) var turboBumps = 0  // hits the turbo autopilot failed to dodge (absorbed): self-test metric
     var scroll = 0.0
     var rng: RNG
     var autopilot = false
     private var aiRun = false        // autopilot touched this run: don't record a best score
     private var aiHolding = false
+    private var trailAt = 0.0
     var sound: (Sfx) -> Void = { _ in }
     var onBest: (Int) -> Void = { _ in }
     var onDeath: () -> Void = {}
@@ -219,6 +353,16 @@ final class Game {
     init(art: Art, seed: UInt64 = UInt64.random(in: 1...UInt64.max)) {
         self.art = art
         rng = RNG(s: seed)
+    }
+
+    var runSpeed: Double { power == .turbo ? min(K.maxSpeed * 1.6, speed * K.turboMul) : speed }
+    var invincible: Bool { power == .turbo || playTime < graceEnd }
+    var powerLeft: Double { power == .none ? 0 : max(0, powerEnd - playTime) }
+    /// Grows over a quarter second when the strawberry kicks in and shrinks back as it wears off.
+    var dinoScale: Double {
+        guard power == .big else { return 1 }
+        let k = min(1, (playTime - powerStart) / 0.25, (powerEnd - playTime) / 0.25)
+        return 1 + (K.bigScale - 1) * max(0, k)
     }
 
     // Input
@@ -229,6 +373,7 @@ final class Game {
         case .idle:
             start(); holding = true; jump()
         case .running:
+            if power == .turbo { return }      // the juice box is driving
             holding = true
             if onGround { jump() } else { bufferedJump = clock }
         case .dead:
@@ -246,14 +391,16 @@ final class Game {
     private func start() {
         phase = .running; paused = false
         things = []; fx = []
-        speed = K.startSpeed; score = 0; runPhase = 0
+        speed = K.startSpeed; score = 0; runPhase = 0; playTime = 0
+        power = .none; graceEnd = -100
         gapLeft = max(120, worldW * 0.55)
-        dinoY = 0; vy = 0; onGround = true
+        dinoY = 0; vy = 0; onGround = true; falling = false
         aiRun = autopilot
     }
 
     private func jump() {
-        vy = K.jumpV; onGround = false
+        vy = power == .big ? K.jumpV * 0.75 : K.jumpV   // a giant only hops, so its head stays on screen
+        onGround = false
         sound(.jump)
     }
 
@@ -261,51 +408,69 @@ final class Game {
 
     func step(_ dt: Double) {
         clock += dt
-        if autopilot { think() }
+        if autopilot || (power == .turbo && phase == .running) { think() }
         if paused { return }
 
         if !onGround {
             vy -= K.gravity * dt
             dinoY += vy * dt
-            if dinoY <= 0 {
-                dinoY = 0; vy = 0; onGround = true
-                if phase == .running { landed() }
+            if falling {
+                dinoY = max(dinoY, -60)
+            } else if dinoY <= 0 {
+                if phase == .running && overOpenPit && pitsCanHurt {
+                    fall()
+                } else {
+                    dinoY = 0; vy = 0; onGround = true
+                    if phase == .running { landed() }
+                }
             }
         }
         for i in fx.indices {
             fx[i].t += dt
-            if case .dust = fx[i].look, phase == .running { fx[i].x -= speed * 0.5 * dt }
+            if case .dust = fx[i].look, phase == .running { fx[i].x -= runSpeed * 0.5 * dt }
         }
         fx.removeAll { $0.t >= $0.life }
 
         switch phase {
         case .idle: return
         case .dead:
-            if !autopilot && clock - deadAt > 25 { phase = .idle; things = []; fx = [] }
+            if !autopilot && clock - deadAt > 25 {
+                phase = .idle; things = []; fx = []
+                dinoY = 0; vy = 0; onGround = true; falling = false
+            }
             return
         case .running: break
         }
 
+        playTime += dt
+        if power != .none && playTime >= powerEnd { endPower() }
         speed = min(K.maxSpeed, speed + K.accel * dt)
+        let v = runSpeed
         let hundreds = Int(score) / 100
-        score += speed * dt / K.pxPerPoint
+        score += v * dt / K.pxPerPoint
         if Int(score) / 100 > hundreds { flashAt = clock; sound(.point) }
-        scroll += speed * dt
-        runPhase += dt * min(20, 8 + speed / 20)
+        scroll += v * dt
+        runPhase += dt * min(26, 8 + v / 20)
 
         for i in things.indices {
-            things[i].x -= (speed + things[i].extraSpeed) * dt
+            things[i].x -= (v + things[i].extraSpeed) * dt
             things[i].t += dt
         }
         things.removeAll { $0.x + $0.width < -60 }
-        gapLeft -= speed * dt
+        gapLeft -= v * dt
         if gapLeft <= 0 { spawn() }
+        openPits()
+        if power == .turbo && onGround && playTime - trailAt > 0.05 {   // speed dust behind the feet
+            trailAt = playTime
+            fx.append(Effect(look: .dust, x: K.dinoX - 4, y: -4, life: 0.22))
+        }
         collide()
+        if phase == .running && onGround && overOpenPit && pitsCanHurt { fall() }
     }
 
     private func landed() {
         fx.append(Effect(look: .dust, x: K.dinoX - 2, y: -4, life: 0.3))
-        fx.append(Effect(look: .dust, x: K.dinoX + 8, y: -4, life: 0.25))
+        fx.append(Effect(look: .dust, x: K.dinoX + 8 * dinoScale, y: -4, life: 0.25))
         if clock - bufferedJump < 0.15 {
             bufferedJump = -100
             jump()
@@ -316,6 +481,7 @@ final class Game {
     private func spawn() {
         var options: [(Kind, Double)] = [(.spikes(1), 3), (.spikes(2), 2)]
         if score >= 100 { options.append((.box(rng.int(2)), 2)) }
+        if score >= 150 { options.append((.pit(0), 1.2)) }
         if score >= 200 { options.append((.saw, 1.5)) }
         if score >= 250 { options.append((.spikes(3), 1.3)) }
         if score >= 350 {
@@ -326,12 +492,25 @@ final class Game {
         var kind = options[0].0
         for (k, w) in options { if r < w { kind = k; break }; r -= w }
 
+        let v = runSpeed
+        if case .pit = kind {
+            // Warning sign first, then the red pebble that marks where the ground will give way.
+            let w = 32 + rng.int(9), lead = max(110, v * 0.9)
+            things.append(Thing(kind: .sign, x: worldW + 4))
+            things.append(Thing(kind: .pit(w), x: worldW + 4 + lead))
+            gapLeft = lead + Double(w) + v * rng.range(0.75, 1.3) + 26
+            return
+        }
+
         let thing = Thing(kind: kind, x: worldW + 4)
         things.append(thing)
-        let gap = speed * rng.range(0.75, 1.6) + 26
+        let gap = v * rng.range(0.75, 1.6) + 26
         gapLeft = thing.width + gap
-        if !thing.isHighBird, rng.unit() < 0.2 {
-            var f = Thing(kind: .fruit(rng.int(4)), x: worldW + 4 + thing.width + gap * rng.range(0.4, 0.6))
+        if !thing.isHighBird, rng.unit() < 0.22 {
+            let p = rng.unit()
+            var k = p < 0.5 ? Fruit.cherry : p < 0.66 ? Fruit.orange : p < 0.83 ? Fruit.strawberry : Fruit.juice
+            if power != .none && (k == Fruit.strawberry || k == Fruit.juice) { k = Fruit.cherry }
+            var f = Thing(kind: .fruit(k), x: worldW + 4 + thing.width + gap * rng.range(0.4, 0.6))
             f.y = rng.range(9, 22)
             things.append(f)
         }
@@ -345,6 +524,7 @@ final class Game {
             return seq[min(Int((clock - deadAt) * 12), seq.count - 1)]
         case .running:
             if !onGround { return vy > 0 ? 6 : 9 }
+            if power == .turbo { return Int(clock * 5) % 4 }   // on skates: glide in the standing pose
             return 4 + Int(runPhase) % 6
         }
     }
@@ -370,20 +550,84 @@ final class Game {
             let f = art.fruits[k][Int(t.t * 20) % 17]
             let f0 = art.fruits[k][0].mask
             return [Part(frame: f, x: t.x - Double(f0.padLeft), y: t.y - Double(f0.padBottom))]
+        case .pit:
+            return t.opened ? [] : [Part(frame: art.pebble, x: t.x, y: 0)]
+        case .sign:
+            return [Part(frame: art.sign, x: t.x, y: 0, scale: 0.5)]
         }
     }
 
+    /// Opaque bounds of a thing in world px, above the ground.
+    func bounds(_ t: Thing) -> CGRect? {
+        var r: CGRect?
+        for p in parts(t) {
+            let b = p.frame.mask.box
+            let pr = CGRect(x: p.x + b.minX * p.scale, y: p.y + b.minY * p.scale, width: b.width * p.scale, height: b.height * p.scale)
+            r = r.map { $0.union(pr) } ?? pr
+        }
+        guard let out = r, out.maxY > 0 else { return nil }
+        return CGRect(x: out.minX, y: max(0, out.minY), width: out.width, height: out.maxY - max(0, out.minY))
+    }
+
+    /// The feet are over a pit that has caved in.
+    var overOpenPit: Bool {
+        things.contains { $0.isPit && $0.opened && $0.x <= K.dinoX + 7 && $0.x + $0.width >= K.dinoX + 16 }
+    }
+    private var pitsCanHurt: Bool { power != .big && !invincible }   // a giant strides across
+
+    /// The ground gives way only once the dino is close: until then, the red pebble is the only cue.
+    private func openPits() {
+        let front = K.dinoX + 4 + 15 * dinoScale
+        for i in things.indices where things[i].isPit && !things[i].opened && things[i].x <= front + runSpeed * K.pitOpenLead {
+            things[i].opened = true
+            let x = things[i].x, w = things[i].width
+            fx.append(Effect(look: .poof, x: x + w / 2 - 16, y: -16, life: 0.33))
+            fx.append(Effect(look: .dust, x: x - 4, y: -4, life: 0.3))
+            fx.append(Effect(look: .dust, x: x + w - 10, y: -4, life: 0.3))
+            sound(.crumble)
+        }
+    }
+
+    private func fall() {
+        falling = true; onGround = false; vy = min(vy, 0)
+        die()
+    }
+
     private func collide() {
+        if power == .big { smash(); return }
         let i = dinoFrame
         let dx = Int(K.dinoX.rounded()), dy = Int((dinoY - 3).rounded())
-        for n in things.indices where !things[n].gone {
+        for n in things.indices where !things[n].gone && (things[n].isFruit || things[n].isSolid) {
             let fruit = things[n].isFruit
             let me = fruit ? art.dino[i].mask : art.dinoHit[i]
             for p in parts(things[n]) where overlaps(me, dx, dy, p.frame.mask, Int(p.x.rounded()), Int(p.y.rounded())) {
                 if fruit { collect(n); break }
+                if invincible {
+                    if power == .turbo { turboBumps += 1; smashThing(n) }
+                    break
+                }
                 die(); return
             }
         }
+    }
+
+    /// Strawberry power: whatever the (scaled) dino touches is destroyed.
+    private func smash() {
+        let s = dinoScale
+        let x0 = K.dinoX + 4 * s, x1 = K.dinoX + 20 * s, y0 = dinoY, y1 = dinoY + 17 * s
+        for n in things.indices where !things[n].gone && (things[n].isFruit || things[n].isSolid) {
+            guard let r = bounds(things[n]), r.minX < x1, r.maxX > x0, r.minY < y1, r.maxY > y0 else { continue }
+            if things[n].isFruit { collect(n) } else { smashThing(n) }
+        }
+    }
+
+    private func smashThing(_ n: Int) {
+        things[n].gone = true
+        score += K.smashBonus
+        let r = bounds(things[n]) ?? CGRect(x: things[n].x, y: 0, width: things[n].width, height: 16)
+        fx.append(Effect(look: .poof, x: r.midX - 16, y: r.minY - 6, life: 0.33))
+        fx.append(Effect(look: .text("+10"), x: r.midX - 8, y: r.maxY + 2, life: 0.6))
+        sound(.smash)
     }
 
     private func collect(_ n: Int) {
@@ -391,34 +635,59 @@ final class Game {
         score += K.fruitBonus
         let p = parts(things[n])[0]
         fx.append(Effect(look: .poof, x: p.x, y: p.y, life: 0.33))
-        fx.append(Effect(look: .text("+50"), x: things[n].x - 3, y: things[n].y + 16, life: 0.7))
-        sound(.fruit)
+        var label = "+50"
+        if case .fruit(let k) = things[n].kind {
+            if k == Fruit.strawberry { begin(.big); label = "BIG!" }
+            if k == Fruit.juice { begin(.turbo); label = "TURBO!" }
+        }
+        fx.append(Effect(look: .text(label), x: things[n].x - 3, y: things[n].y + 16, life: label == "+50" ? 0.7 : 1.0))
+        sound(label == "+50" ? .fruit : .power)
+    }
+
+    private func begin(_ p: Power) {
+        let grown = power == .big && p == .big
+        if power == .turbo { endTurboControl() }
+        power = p
+        powerStart = grown ? playTime - 1 : playTime   // a second strawberry extends without re-growing
+        powerEnd = playTime + (p == .big ? K.bigTime : K.turboTime)
+        if p == .turbo { holding = false; bufferedJump = -100 }
+    }
+
+    private func endPower() {
+        if power == .turbo { endTurboControl() }
+        power = .none
+        graceEnd = playTime + K.grace     // a moment to get your bearings at normal speed and size
+    }
+
+    private func endTurboControl() {
+        if !autopilot { aiHolding = false; holding = false }
     }
 
     private func die() {
         phase = .dead; deadAt = clock; holding = false; aiHolding = false
+        power = .none
         sound(.hit)
         if !aiRun && Int(score) > best { best = Int(score); onBest(best) }
         onDeath()
     }
 
-    /// Autopilot: plays the game itself (demo mode, and the self-test's fairness check).
+    /// Autopilot: plays the game itself (demo mode, the apple power, and the self-test's fairness check).
     private func think() {
         switch phase {
-        case .idle: press(); release(); return
-        case .dead: if clock - deadAt > 1.6 { press(); release() }; return
+        case .idle: if autopilot { press(); release() }; return
+        case .dead: if autopilot && clock - deadAt > 1.6 { press(); release() }; return
         case .running: break
         }
         if paused { return }
         if aiHolding && !onGround && vy < 30 { aiHolding = false; release() }
-        guard onGround else { return }
+        guard onGround, power != .big else { return }    // a giant just walks through
         let body = K.dinoX + 4
-        guard let next = things.filter({ !$0.isFruit && !$0.isHighBird && $0.x + $0.width > body })
+        guard let next = things.filter({ !$0.gone && ($0.isSolid || $0.isPit) && !$0.isHighBird && $0.x + $0.width > body })
             .min(by: { $0.x < $1.x }) else { return }
-        let rel = speed + next.extraSpeed
+        let rel = runSpeed + next.extraSpeed
         let travel = rel * 2 * K.jumpV / K.gravity
         let lead = max(2, (travel - next.width - 15) / 2)
-        if next.x - (body + 15) <= lead { press(); aiHolding = true }
+        if next.x - (body + 15) <= lead { holding = true; jump(); aiHolding = true }
     }
 }
 
@@ -429,10 +698,12 @@ final class Scene {
     let root = CALayer()
     private let backdrop = CALayer()           // shows the click-to-jump zone while hovered
     private let world = CALayer()
-    private let groundL = CALayer()            // static line, edge fade baked in
+    private let groundBox = CALayer()          // ground line segments (gaps where pits have opened) + holes
+    private var groundImg: CGImage?            // the full-width line, edge fade baked in
     private let thingBox = CALayer()           // clips at the ground so the saw sits half buried
-    private let shadowL = CALayer(), dinoL = CALayer(), hudL = CALayer(), msgL = CALayer()
+    private let shadowL = CALayer(), dinoL = CALayer(), skateL = CALayer(), juiceL = CALayer(), hudL = CALayer(), msgL = CALayer()
     private var thingPool: [CALayer] = [], fxPool: [CALayer] = [], pebblePool: [CALayer] = []
+    private var groundPool: [CALayer] = [], holePool: [CALayer] = []
     private var hudKey = "", msgKey = ""
     private var pebblesColored = 0
     private var textCache: [String: CGImage] = [:]
@@ -454,13 +725,15 @@ final class Scene {
         thingBox.masksToBounds = true
         root.addSublayer(backdrop)
         root.addSublayer(world)
-        world.addSublayer(groundL)
+        world.addSublayer(groundBox)
         world.addSublayer(shadowL)
         world.addSublayer(thingBox)
         world.addSublayer(dinoL)
+        world.addSublayer(skateL)
+        world.addSublayer(juiceL)
         root.addSublayer(hudL)
         root.addSublayer(msgL)
-        [groundL, shadowL, dinoL, hudL, msgL].forEach(pixelate)
+        [shadowL, dinoL, skateL, juiceL, hudL, msgL].forEach(pixelate)
     }
 
     private func pixelate(_ l: CALayer) {
@@ -480,8 +753,8 @@ final class Scene {
         world.frame = root.bounds
         let groundTop = snap(CGFloat(K.below) * px)
         thingBox.frame = CGRect(x: 0, y: groundTop, width: size.width, height: size.height - groundTop)
-        groundL.contents = groundImage()
-        groundL.frame = CGRect(x: 0, y: groundTop - px, width: size.width, height: px)
+        groundBox.frame = root.bounds
+        groundImg = groundImage()
         hudKey = ""; msgKey = ""; textCache = [:]
         CATransaction.commit()
     }
@@ -509,10 +782,10 @@ final class Scene {
     }
 
     /// World px -> layer frame (points), relative to `parentY` (0 for world, ground top for things).
-    private func place(_ l: CALayer, _ img: CGImage, _ x: Double, _ y: Double, parentY: CGFloat = 0) {
+    private func place(_ l: CALayer, _ img: CGImage, _ x: Double, _ y: Double, parentY: CGFloat = 0, scale: Double = 1) {
         if (l.contents as AnyObject?) !== img { l.contents = img }
         l.frame = CGRect(x: snap(CGFloat(x) * px), y: snap(CGFloat(y + K.below) * px) - parentY,
-                         width: CGFloat(img.width) * px, height: CGFloat(img.height) * px)
+                         width: snap(CGFloat(Double(img.width) * scale) * px), height: snap(CGFloat(Double(img.height) * scale) * px))
     }
 
     private func pooled(_ pool: inout [CALayer], _ i: Int, in parent: CALayer) -> CALayer {
@@ -532,8 +805,32 @@ final class Scene {
         defer { CATransaction.commit() }
         backdrop.isHidden = !hover
 
+        // Ground line, cut where pits have opened; the holes show through the gaps.
+        let pits = g.things.filter { $0.isPit && $0.opened }
+        let gaps = pits.map { (snap(CGFloat($0.x) * px), snap(CGFloat($0.x + $0.width) * px)) }.sorted { $0.0 < $1.0 }
+        var n = 0, from: CGFloat = 0
+        func segment(_ a: CGFloat, _ b: CGFloat) {
+            guard b > a, let img = groundImg else { return }
+            let l = pooled(&groundPool, n, in: groundBox)
+            if (l.contents as AnyObject?) !== img { l.contents = img }
+            l.contentsRect = CGRect(x: a / size.width, y: 0, width: (b - a) / size.width, height: 1)
+            l.frame = CGRect(x: a, y: thingBox.frame.minY - px, width: b - a, height: px)
+            n += 1
+        }
+        for (a, b) in gaps { segment(from, min(a, size.width)); from = max(from, b) }
+        segment(from, size.width)
+        for i in n..<groundPool.count { groundPool[i].isHidden = true }
+        n = 0
+        for p in pits {
+            let l = pooled(&holePool, n, in: groundBox)
+            place(l, art.hole(Int(p.width)), p.x, -K.below)
+            l.opacity = fade(l.frame.midX)
+            n += 1
+        }
+        for i in n..<holePool.count { holePool[i].isHidden = true }
+
         // Pebbles under the ground line scroll with the world (tiny colour layers, no bitmaps).
-        var n = 0
+        n = 0
         let period = Scene.pebblePeriod
         let shift = g.scroll.truncatingRemainder(dividingBy: period)
         for k in 0...Int(g.worldW / period) + 1 {
@@ -541,7 +838,7 @@ final class Scene {
                 var x = p.x - shift
                 if x < 0 { x += period }
                 x += Double(k) * period
-                if x > g.worldW + 2 { continue }
+                if x > g.worldW + 2 || pits.contains(where: { x + p.w > $0.x && x < $0.x + $0.width }) { continue }
                 let l = pooled(&pebblePool, n, in: world)
                 if n >= pebblesColored { l.backgroundColor = CGColor(gray: 0.45, alpha: 1); pebblesColored = n + 1 }
                 l.frame = CGRect(x: snap(CGFloat(x) * px), y: CGFloat(p.y + K.below) * px, width: CGFloat(p.w) * px, height: px)
@@ -551,16 +848,32 @@ final class Scene {
         }
         for i in n..<pebblePool.count { pebblePool[i].isHidden = true }
 
-        place(shadowL, art.shadow, K.dinoX, -3)
+        let s = g.dinoScale
+        place(shadowL, art.shadow, K.dinoX, -3 * s, scale: s)
         shadowL.opacity = Float(0.55 * max(0.2, 1 - g.dinoY / 45))
-        place(dinoL, art.dino[g.dinoFrame].image, K.dinoX, g.dinoY - 3)
+        shadowL.isHidden = g.falling || g.overOpenPit
+        // Turbo: roller skates lift the dino onto its wheels, and it sips the juice box on the way.
+        let skating = g.power == .turbo && g.phase == .running
+        let frame = g.dinoFrame
+        let bodyY = g.dinoY - 3 * s + (skating ? K.skateLift : 0)
+        place(dinoL, art.dino[frame].image, K.dinoX, bodyY, scale: s)
+        skateL.isHidden = !skating; juiceL.isHidden = !skating
+        if skating {
+            place(skateL, art.skates[Int(g.playTime * 14) % 2], K.dinoX + 5, g.dinoY)
+            let bob = Double(art.dino[frame].mask.box.maxY - art.dino[0].mask.box.maxY)   // follow the head
+            place(juiceL, art.juiceHeld[Int(g.playTime * 6) % 3], K.dinoX + 16, bodyY + 5 + bob)
+        }
+        // Blink while a power is about to wear off and during the grace moment after it.
+        let ending = (g.power != .none && g.powerLeft < 1.5) || (g.phase == .running && g.playTime < g.graceEnd)
+        dinoL.opacity = ending && Int(g.playTime * 10) % 2 == 1 ? 0.35 : 1
+        skateL.opacity = dinoL.opacity; juiceL.opacity = dinoL.opacity
 
         let groundTop = thingBox.frame.minY
         n = 0
         for t in g.things where !t.gone {
             for p in g.parts(t) {
                 let l = pooled(&thingPool, n, in: thingBox)
-                place(l, p.frame.image, p.x, p.y, parentY: groundTop)
+                place(l, p.frame.image, p.x, p.y, parentY: groundTop, scale: p.scale)
                 l.opacity = fade(l.frame.midX)
                 n += 1
             }
@@ -585,8 +898,10 @@ final class Scene {
         for i in n..<fxPool.count { fxPool[i].isHidden = true }
 
         // HUD: best + score, top right. The score blinks for a second at every 100.
-        var hud = g.best > 0 ? "HI " + String(format: "%05d", g.best) : ""
-        if g.phase != .idle { hud += (hud.isEmpty ? "" : "  ") + String(format: "%05d", Int(g.score)) }
+        var hud = g.power == .big ? "BIG " : g.power == .turbo ? "TURBO " : ""
+        if g.power != .none { hud += "\(Int(g.powerLeft.rounded(.up)))  " }
+        hud += g.best > 0 ? "HI " + String(format: "%05d", g.best) : ""
+        if g.phase != .idle { hud += (hud.isEmpty || hud.hasSuffix(" ") ? "" : "  ") + String(format: "%05d", Int(g.score)) }
         if hud != hudKey {
             hudKey = hud
             if hud.isEmpty { hudL.contents = nil } else {
@@ -670,6 +985,9 @@ final class Sounds {
         players[.point] = make(tone(880, 0.06) + tone(1320, 0.11))
         players[.fruit] = make(tone(990, 0.04) + tone(1320, 0.04) + tone(1760, 0.08))
         players[.hit] = make(sweep(320, 70, 0.28, noise: 0.35))
+        players[.power] = make(tone(660, 0.05) + tone(880, 0.05) + tone(1100, 0.05) + tone(1320, 0.05) + tone(1760, 0.12))
+        players[.smash] = make(sweep(220, 60, 0.12, noise: 0.6))
+        players[.crumble] = make(sweep(150, 45, 0.22, noise: 0.75))
     }
 
     func play(_ s: Sfx) {
@@ -1111,11 +1429,12 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
         a.informativeText = """
         An endless runner that lives on top of your Dock.
         Jump with Right ⌥, ⌃⌥Space, or a click. Hold for a higher jump.
-        Stay low under high-flying hawks.
+        Stay low under high-flying pterodactyls. Jump at the red pebble after a PIT AHEAD sign.
+        Strawberry: grow big and smash everything. Juice box: turbo on roller skates, the dino drives itself.
 
         Dino sprites: Arks (@ArksDigital), CC BY 4.0, arks.itch.io/dino-characters
         Spikes, crates, saw, fruit, dust & font: Pixel Frog, CC0, pixelfrog-assets.itch.io
-        Hawks: MoikMellah, CC0, opengameart.org/content/animated-birds-32x32
+        Pterodactyls, sign, pebble, juice box and skates: drawn for Dockosaur
         """
         NSApp.activate(ignoringOtherApps: true)
         a.runModal()
@@ -1139,6 +1458,19 @@ func snapshot(_ args: [String]) {
         if let s = arg("--score").flatMap(Double.init) { g.press(); g.release(); g.score = s }
         var t = 0.0
         while t < seconds { g.step(1.0 / 120); t += 1.0 / 120 }
+        if let pw = arg("--power") {   // eat a power fruit, then run a little: --power big|turbo
+            g.things.append(Thing(kind: .fruit(pw == "big" ? Fruit.strawberry : Fruit.juice), x: K.dinoX + 6, y: 8))
+            for _ in 0..<60 { g.step(1.0 / 120) }
+            if args.contains("--clear") { for _ in 0..<45 { g.things = []; g.step(1.0 / 120) } }   // land and cruise
+        }
+        if args.contains("--pit") {    // a staged pit scene: open pit under a jumping dino, sign + pebble ahead
+            g.autopilot = false
+            var open = Thing(kind: .pit(36), x: K.dinoX + 2); open.opened = true
+            g.things = [open, Thing(kind: .bird(0, high: true), x: 70), Thing(kind: .bird(1, high: false), x: 125),
+                        Thing(kind: .sign, x: g.worldW - 150), Thing(kind: .pit(36), x: g.worldW - 40),
+                        Thing(kind: .fruit(Fruit.juice), x: g.worldW - 75, y: 14)]
+            g.dinoY = 22; g.onGround = false; g.vy = 0
+        }
         if arg("--phase") == "dead" { g.autopilot = false; g.things.removeAll(); g.paused = false
             // run into a wall of spikes to show the game-over screen
             g.things.append(Thing(kind: .spikes(3), x: K.dinoX + 6)); g.step(1.0 / 120); g.step(0.5) }
@@ -1182,7 +1514,8 @@ func selftest() -> Int32 {
     check(art.dino[4...9].map(\.mask.padBottom).min() == 3 && art.dino[4].mask.padLeft == 4, "dino feet/left padding is 3/4 px")
     check(art.saw.count == 8 && art.birds.allSatisfy { $0.count == 5 && !$0[2].mask.isEmpty }, "saw + bird frames")
     check(art.fruits.allSatisfy { $0.count == 17 }, "fruit frames")
-    for ch in "HI 0123456789 GAME OVER PAUSED TAP RIGHT OPTION TO PLAY CLICK OR CTRL+OPT+SPACE +50" where ch != " " {
+    check(art.juiceHeld.count == 3 && art.skates.count == 2 && !art.fruits[Fruit.juice][0].mask.isEmpty, "juice box + skates")
+    for ch in "HI 0123456789 GAME OVER PAUSED TAP RIGHT OPTION TO PLAY CLICK OR CTRL+OPT+SPACE +50 +10 BIG! TURBO! PIT AHEAD" where ch != " " {
         check(art.glyphs[ch] != nil, "glyph \(ch)")
     }
 
@@ -1205,16 +1538,55 @@ func selftest() -> Int32 {
     for _ in 0..<12 { b.things[0].x = K.dinoX + 4; b.step(1.0 / 120) }
     check(b.phase == .running, "dino passes under a high hawk")
 
+    // Strawberry: the dino grows and smashes what it runs into.
+    let s = Game(art: art, seed: 1)
+    s.press(); s.release(); s.step(1)
+    s.things = [Thing(kind: .fruit(Fruit.strawberry), x: K.dinoX + 6, y: 8)]
+    s.step(1.0 / 120)
+    check(s.power == .big, "strawberry makes the dino big")
+    for _ in 0..<40 { s.step(1.0 / 120) }
+    check(s.dinoScale > 1.7, "big dino grows to full size (\(s.dinoScale))")
+    s.things = [Thing(kind: .box(0), x: K.dinoX + 40), Thing(kind: .bird(0, high: true), x: K.dinoX + 90)]
+    for _ in 0..<90 { s.step(1.0 / 120) }
+    check(s.phase == .running && s.things.allSatisfy(\.gone), "big dino smashes a crate and a pterodactyl")
+    for _ in 0..<(7 * 120) { s.things = []; s.step(1.0 / 120) }
+    check(s.power == .none && s.dinoScale == 1, "big wears off")
+
+    // Juice box: turbo speed, and the player's presses are ignored while it drives.
+    let a = Game(art: art, seed: 1)
+    a.press(); a.release(); a.step(1)
+    a.things = [Thing(kind: .fruit(Fruit.juice), x: K.dinoX + 6, y: 8)]
+    a.step(1.0 / 120)
+    check(a.power == .turbo && a.runSpeed > a.speed * 1.5, "juice box gives turbo")
+    a.things = []; a.press()
+    check(a.onGround, "presses are ignored during turbo")
+
+    // Pit: closed while far away (only the pebble shows), opens near the dino, and standing over it is fatal.
+    let p = Game(art: art, seed: 1)
+    p.press(); p.release(); p.step(1)
+    p.things = [Thing(kind: .pit(36), x: 160)]
+    p.step(1.0 / 120)
+    check(!p.things[0].opened && p.parts(p.things[0]).count == 1, "pit hidden behind its pebble at a distance")
+    for _ in 0..<120 { p.step(1.0 / 120) }
+    check(p.things.first?.opened == true && p.phase == .dead && p.falling, "running onto a pit drops the dino")
+    let q = Game(art: art, seed: 1)
+    q.press(); q.release(); q.step(1)
+    q.things = [Thing(kind: .pit(40), x: 160)]
+    q.autopilot = true
+    for _ in 0..<240 { q.step(1.0 / 120) }
+    check(q.phase == .running, "a timed jump clears a pit")
+
     // Fairness: the autopilot should survive long stretches at every speed.
-    var deaths = 0, bestScore = 0
+    var deaths = 0, bestScore = 0, bumps = 0
     for seed in 1...6 {
         let a = Game(art: art, seed: UInt64(seed))
         a.autopilot = true
         a.onDeath = { deaths += 1; bestScore = max(bestScore, Int(a.score)) }
         for _ in 0..<(300 * 120) { a.step(1.0 / 120) }
         bestScore = max(bestScore, Int(a.score))
+        bumps += a.turboBumps
     }
-    print("autopilot: \(deaths) deaths in 30 simulated minutes, best run \(bestScore)")
+    print("autopilot: \(deaths) deaths in 30 simulated minutes, best run \(bestScore), turbo bumps \(bumps)")
     check(deaths <= 6, "autopilot dies too often (\(deaths)) - gaps may be unfair")
     print(fails == 0 ? "selftest OK" : "selftest: \(fails) failures")
     return fails == 0 ? 0 : 1
